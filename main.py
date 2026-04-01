@@ -135,7 +135,7 @@ def build_email(prs: list[dict], repo: str, forgejo_url: str) -> tuple[str, str]
       <p><strong>{subject_count}</strong> opened in the last 24 hours.</p>
       {table}
       <p style='color:#aaa;font-size:11px;margin-top:24px;'>
-        Generated from <a href='{forgejo_url}/{repo}'>{forgejo_url}/{repo}</a>
+        Generated from <a href='{forgejo_url}/{repo}/pulls'>{forgejo_url}/{repo}/pulls</a>
       </p>
     </body>
     </html>
@@ -172,7 +172,6 @@ def main() -> None:
     prs = fetch_prs_last_24h(cfg["forgejo_url"], cfg["forgejo_token"], repo)
     print(f"Found {len(prs)} PR(s) opened in the last 24 hours.")
 
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     count = len(prs)
     plural = 's' if count != 1 else ''
     subject = f"[{repo}] PR Summary — {count} PR{plural}"
