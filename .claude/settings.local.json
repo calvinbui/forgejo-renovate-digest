@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(pylint main.py)",
-      "Bash(npx markdownlint-cli:*)"
-    ]
-  }
-}
