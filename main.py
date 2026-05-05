@@ -44,7 +44,7 @@ def get_config() -> dict:
 
 
 def fetch_prs_last_24h(forgejo_url: str, token: str, repo: str) -> list[dict]:
-    """Fetch all PRs opened in the last 24 hours via the Forgejo API."""
+    """Fetch all PRs opened or updated in the last 24 hours via the Forgejo API."""
     since = datetime.now(timezone.utc) - timedelta(hours=24)
     headers = {"Authorization": f"token {token}", "Accept": "application/json"}
     prs_recent = []
@@ -55,6 +55,7 @@ def fetch_prs_last_24h(forgejo_url: str, token: str, repo: str) -> list[dict]:
         params = {
             "state": "open",
             "type": "pulls",
+            "sort": "recentupdate",
             "page": page,
             "limit": 50,
         }
@@ -73,11 +74,11 @@ def fetch_prs_last_24h(forgejo_url: str, token: str, repo: str) -> list[dict]:
             break
 
         for pr in prs:
-            created_at = datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00"))
-            if created_at >= since:
+            updated_at = datetime.fromisoformat(pr["updated_at"].replace("Z", "+00:00"))
+            if updated_at >= since:
                 prs_recent.append(pr)
             else:
-                # PRs are returned newest-first; stop once we pass the 24h window
+                # PRs are returned by most-recently-updated; stop once we pass the 24h window
                 return prs_recent
 
         page += 1
@@ -87,31 +88,51 @@ def fetch_prs_last_24h(forgejo_url: str, token: str, repo: str) -> list[dict]:
 
 def build_email(prs: list[dict], repo: str, forgejo_url: str) -> tuple[str, str]:
     """Return (plain_text, html) email bodies."""
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    count = len(prs)
-    subject_count = f"{count} PR{'s' if count != 1 else ''}"
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    now_str = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    all_prs_url = f"{forgejo_url}/{repo}/pulls"
+
+    new_prs = [pr for pr in prs if datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")) >= since]
+    updated_prs = [pr for pr in prs if datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")) < since]
+
+    parts = []
+    if new_prs:
+        n = len(new_prs)
+        parts.append(f"{n} new PR{'s' if n != 1 else ''}")
+    if updated_prs:
+        n = len(updated_prs)
+        parts.append(f"{n} updated PR{'s' if n != 1 else ''}")
+    summary_str = ", ".join(parts) if parts else "no activity"
 
     # --- Plain text ---
     lines = [
         f"Daily PR Summary for {repo}",
+        f"All PRs: {all_prs_url}",
         f"Generated: {now_str}",
-        f"{subject_count} opened in the last 24 hours.",
+        summary_str,
         "",
     ]
-    if prs:
-        for pr in prs:
+    if new_prs:
+        lines.append("New PRs:")
+        for pr in new_prs:
             lines.append(f"  #{pr['number']} {pr['title']}")
-            lines.append(f"    URL: {pr['html_url']}")
+            lines.append(f"    {pr['html_url']}")
             lines.append("")
-    else:
-        lines.append("No pull requests were opened in the last 24 hours.")
+    if updated_prs:
+        lines.append("Updated PRs:")
+        for pr in updated_prs:
+            lines.append(f"  #{pr['number']} {pr['title']}")
+            lines.append(f"    {pr['html_url']}")
+            lines.append("")
+    if not prs:
+        lines.append("No pull requests were opened or updated in the last 24 hours.")
 
     plain = "\n".join(lines)
 
     # --- HTML ---
-    if prs:
+    def make_rows(pr_list: list[dict]) -> str:
         rows = ""
-        for pr in prs:
+        for pr in pr_list:
             rows += f"""
             <tr>
               <td style='padding:12px 16px;border-bottom:1px solid #eee;vertical-align:top;'>
@@ -121,22 +142,34 @@ def build_email(prs: list[dict], repo: str, forgejo_url: str) -> tuple[str, str]
                 </a>
               </td>
             </tr>"""
-        table = f"<table style='width:100%;border-collapse:collapse;'>{rows}</table>"
-    else:
-        table = "<p style='color:#555;'>No pull requests were opened in the last 24 hours.</p>"
+        return rows
+
+    new_section = ""
+    if new_prs:
+        new_section = f"""
+      <h3 style='margin-bottom:4px;'>New</h3>
+      <table style='width:100%;border-collapse:collapse;'>{make_rows(new_prs)}</table>"""
+
+    updated_section = ""
+    if updated_prs:
+        updated_section = f"""
+      <h3 style='margin-bottom:4px;'>Updated</h3>
+      <table style='width:100%;border-collapse:collapse;'>{make_rows(updated_prs)}</table>"""
+
+    content = new_section + updated_section
+    if not prs:
+        content = "<p style='color:#555;'>No pull requests were opened or updated in the last 24 hours.</p>"
 
     html = f"""
     <html>
     <body style='font-family:sans-serif;max-width:700px;margin:0 auto;padding:24px;'>
       <h2 style='margin-bottom:4px;'>Daily PR Summary</h2>
-      <p style='color:#555;margin-top:0;'>
-        <strong>{repo}</strong> &mdash; {now_str}
+      <p style='margin-top:0;'>
+        <a href='{all_prs_url}'>{all_prs_url}</a>
       </p>
-      <p><strong>{subject_count}</strong> opened in the last 24 hours.</p>
-      {table}
-      <p style='color:#aaa;font-size:11px;margin-top:24px;'>
-        Generated from <a href='{forgejo_url}/{repo}/pulls'>{forgejo_url}/{repo}/pulls</a>
-      </p>
+      <p style='color:#555;'><strong>{repo}</strong> - {now_str}</p>
+      <p>{summary_str}</p>
+      {content}
     </body>
     </html>
     """
@@ -168,13 +201,19 @@ def main() -> None:
     cfg = get_config()
     repo = cfg["repo"]
 
-    print(f"Fetching PRs opened in the last 24 hours in {repo} ...")
+    print(f"Fetching PRs opened or updated in the last 24 hours in {repo} ...")
     prs = fetch_prs_last_24h(cfg["forgejo_url"], cfg["forgejo_token"], repo)
-    print(f"Found {len(prs)} PR(s) opened in the last 24 hours.")
+    print(f"Found {len(prs)} PR(s) opened or updated in the last 24 hours.")
 
-    count = len(prs)
-    plural = 's' if count != 1 else ''
-    subject = f"[{repo}] PR Summary — {count} PR{plural}"
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    new_count = sum(1 for pr in prs if datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")) >= since)
+    upd_count = len(prs) - new_count
+    parts = []
+    if new_count:
+        parts.append(f"{new_count} new PR{'s' if new_count != 1 else ''}")
+    if upd_count:
+        parts.append(f"{upd_count} updated PR{'s' if upd_count != 1 else ''}")
+    subject = f"[{repo}] PR Summary - {', '.join(parts) if parts else 'no activity'}"
 
     plain, html = build_email(prs, repo, cfg["forgejo_url"])
     send_email(cfg, subject, plain, html)
