@@ -4,6 +4,7 @@ Fetches all PRs opened today in a given repo and sends a summary email via SMTP.
 Configuration is read from a .env file or environment variables.
 """
 
+import argparse
 import smtplib
 import sys
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ import os
 
 import requests
 from dotenv import load_dotenv
+from rich.console import Console
 
 load_dotenv()
 
@@ -86,6 +88,25 @@ def fetch_prs_last_24h(forgejo_url: str, token: str, repo: str) -> list[dict]:
     return prs_recent
 
 
+def has_title_change_in_24h(forgejo_url: str, token: str, repo: str, pr_number: int, since: datetime) -> bool:
+    """Return True if the PR had a title rename event in the last 24 hours."""
+    headers = {"Authorization": f"token {token}", "Accept": "application/json"}
+    url = f"{forgejo_url}/api/v1/repos/{repo}/issues/{pr_number}/timeline"
+    page = 1
+    while True:
+        resp = requests.get(url, headers=headers,
+                            params={"page": page, "limit": 50, "since": since.isoformat()},
+                            timeout=15)
+        resp.raise_for_status()
+        events = resp.json()
+        if not events:
+            return False
+        for event in events:
+            if event.get("type") == "rename":
+                return True
+        page += 1
+
+
 def build_email(prs: list[dict], repo: str, forgejo_url: str) -> tuple[str, str]:
     """Return (plain_text, html) email bodies."""
     since = datetime.now(timezone.utc) - timedelta(hours=24)
@@ -95,21 +116,11 @@ def build_email(prs: list[dict], repo: str, forgejo_url: str) -> tuple[str, str]
     new_prs = [pr for pr in prs if datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")) >= since]
     updated_prs = [pr for pr in prs if datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")) < since]
 
-    parts = []
-    if new_prs:
-        n = len(new_prs)
-        parts.append(f"{n} new PR{'s' if n != 1 else ''}")
-    if updated_prs:
-        n = len(updated_prs)
-        parts.append(f"{n} updated PR{'s' if n != 1 else ''}")
-    summary_str = ", ".join(parts) if parts else "no activity"
-
     # --- Plain text ---
     lines = [
         f"Daily PR Summary for {repo}",
         f"All PRs: {all_prs_url}",
         f"Generated: {now_str}",
-        summary_str,
         "",
     ]
     if new_prs:
@@ -168,7 +179,6 @@ def build_email(prs: list[dict], repo: str, forgejo_url: str) -> tuple[str, str]
         <a href='{all_prs_url}'>{all_prs_url}</a>
       </p>
       <p style='color:#555;'><strong>{repo}</strong> - {now_str}</p>
-      <p>{summary_str}</p>
       {content}
     </body>
     </html>
@@ -186,37 +196,58 @@ def send_email(cfg: dict, subject: str, plain: str, html: str) -> None:
     msg.attach(MIMEText(plain, "plain"))
     msg.attach(MIMEText(html, "html"))
 
-    print(f"Connecting to SMTP server {cfg['smtp_host']}:{cfg['smtp_port']} ...")
     with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"], timeout=15) as server:
         if cfg["smtp_tls"]:
             server.starttls()
         server.login(cfg["smtp_user"], cfg["smtp_password"])
         server.sendmail(cfg["email_from"], cfg["email_to"], msg.as_string())
 
-    print(f"Email sent to {cfg['email_to']}")
-
 
 def main() -> None:
     """Fetch PRs from the last 24 hours and send the summary email."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", "--check", action="store_true", help="Fetch and build email but do not send it")
+    args = parser.parse_args()
+
+    console = Console()
     cfg = get_config()
     repo = cfg["repo"]
-
-    print(f"Fetching PRs opened or updated in the last 24 hours in {repo} ...")
-    prs = fetch_prs_last_24h(cfg["forgejo_url"], cfg["forgejo_token"], repo)
-    print(f"Found {len(prs)} PR(s) opened or updated in the last 24 hours.")
-
     since = datetime.now(timezone.utc) - timedelta(hours=24)
-    new_count = sum(1 for pr in prs if datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")) >= since)
-    upd_count = len(prs) - new_count
+
+    with console.status(f"Fetching PRs for {repo}..."):
+        all_prs = fetch_prs_last_24h(cfg["forgejo_url"], cfg["forgejo_token"], repo)
+        console.print(f"[green]✓[/green] Fetched {len(all_prs)} PR(s) with recent activity")
+
+    candidates = [pr for pr in all_prs if datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")) < since]
+    new_prs = [pr for pr in all_prs if datetime.fromisoformat(pr["created_at"].replace("Z", "+00:00")) >= since]
+    if candidates:
+        with console.status(f"Checking {len(candidates)} updated PR(s) for title changes..."):
+            updated_prs = [
+                pr for pr in candidates
+                if has_title_change_in_24h(cfg["forgejo_url"], cfg["forgejo_token"], repo, pr["number"], since)
+            ]
+            console.print(f"[green]✓[/green] {len(new_prs)} new, {len(updated_prs)} updated with title changes")
+    else:
+        updated_prs = []
+    prs = new_prs + updated_prs
+
     parts = []
-    if new_count:
-        parts.append(f"{new_count} new PR{'s' if new_count != 1 else ''}")
-    if upd_count:
-        parts.append(f"{upd_count} updated PR{'s' if upd_count != 1 else ''}")
+    if new_prs:
+        n = len(new_prs)
+        parts.append(f"{n} new PR{'s' if n != 1 else ''}")
+    if updated_prs:
+        n = len(updated_prs)
+        parts.append(f"{n} updated PR{'s' if n != 1 else ''}")
     subject = f"[{repo}] PR Summary - {', '.join(parts) if parts else 'no activity'}"
 
     plain, html = build_email(prs, repo, cfg["forgejo_url"])
-    send_email(cfg, subject, plain, html)
+
+    if args.dry_run:
+        console.print(f"[yellow]✗[/yellow] Dry run — email not sent ([bold]{subject}[/bold])")
+    else:
+        with console.status(f"Sending email to {cfg['email_to']}..."):
+            send_email(cfg, subject, plain, html)
+            console.print(f"[green]✓[/green] Sent to {cfg['email_to']}: {subject}")
 
 
 if __name__ == "__main__":
